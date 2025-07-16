@@ -7,7 +7,176 @@ import hashlib
 from typing import Dict, List, Any, Optional
 from copy import deepcopy
 
-# Initial database data - must be defined before functions that use it
+# In-memory storage with performance optimizations
+activities_data: Dict[str, Dict[str, Any]] = {}
+teachers_data: Dict[str, Dict[str, Any]] = {}
+
+# Create indexed lookups for performance
+_day_index: Dict[str, List[str]] = {}  # day -> list of activity names
+_time_index: Dict[str, List[str]] = {}  # time_range -> list of activity names
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA-256 for consistency and performance"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def _build_indexes():
+    """Build performance indexes for faster filtering"""
+    global _day_index, _time_index
+    _day_index.clear()
+    _time_index.clear()
+    
+    for activity_name, activity in activities_data.items():
+        # Index by days
+        for day in activity.get("schedule_details", {}).get("days", []):
+            if day not in _day_index:
+                _day_index[day] = []
+            _day_index[day].append(activity_name)
+        
+        # Index by time ranges for faster filtering
+        start_time = activity.get("schedule_details", {}).get("start_time", "")
+        end_time = activity.get("schedule_details", {}).get("end_time", "")
+        if start_time and end_time:
+            time_key = f"{start_time}-{end_time}"
+            if time_key not in _time_index:
+                _time_index[time_key] = []
+            _time_index[time_key].append(activity_name)
+
+def init_database():
+    """Initialize in-memory database if empty - optimized for performance"""
+    global activities_data, teachers_data
+    
+    # Initialize activities if empty
+    if not activities_data:
+        activities_data = deepcopy(initial_activities)
+        
+    # Initialize teacher accounts if empty  
+    if not teachers_data:
+        for teacher in initial_teachers:
+            teachers_data[teacher["username"]] = teacher.copy()
+    
+    # Build performance indexes
+    _build_indexes()
+
+class InMemoryCollection:
+    """High-performance in-memory collection that mimics MongoDB interface"""
+    
+    def __init__(self, data_store: Dict[str, Dict[str, Any]]):
+        self.data = data_store
+    
+    def find(self, query: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Optimized find with indexing support"""
+        if not query:
+            return [{"_id": k, **v} for k, v in self.data.items()]
+        
+        # Optimize day-based queries using index
+        if "schedule_details.days" in query:
+            day_filter = query["schedule_details.days"]
+            if isinstance(day_filter, dict) and "$in" in day_filter:
+                day = day_filter["$in"][0]
+                if day in _day_index:
+                    matching_names = _day_index[day]
+                    results = []
+                    for name in matching_names:
+                        activity = self.data.get(name)
+                        if activity and self._matches_query({"_id": name, **activity}, query):
+                            results.append({"_id": name, **activity})
+                    return results
+        
+        # Fallback to full scan with optimized matching
+        results = []
+        for k, v in self.data.items():
+            doc = {"_id": k, **v}
+            if self._matches_query(doc, query):
+                results.append(doc)
+        return results
+    
+    def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Optimized single document lookup"""
+        # Direct ID lookup for performance
+        if "_id" in query and len(query) == 1:
+            doc_id = query["_id"]
+            if doc_id in self.data:
+                return {"_id": doc_id, **self.data[doc_id]}
+            return None
+        
+        # Use find and return first result
+        results = self.find(query)
+        return results[0] if results else None
+    
+    def update_one(self, query: Dict[str, Any], update: Dict[str, Any]) -> 'UpdateResult':
+        """Optimized single document update"""
+        doc = self.find_one(query)
+        if not doc:
+            return UpdateResult(0)
+        
+        doc_id = doc["_id"]
+        
+        if "$push" in update:
+            for field, value in update["$push"].items():
+                if field not in self.data[doc_id]:
+                    self.data[doc_id][field] = []
+                self.data[doc_id][field].append(value)
+        
+        if "$pull" in update:
+            for field, value in update["$pull"].items():
+                if field in self.data[doc_id] and isinstance(self.data[doc_id][field], list):
+                    while value in self.data[doc_id][field]:
+                        self.data[doc_id][field].remove(value)
+        
+        return UpdateResult(1)
+    
+    def aggregate(self, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Optimized aggregation for day lookup"""
+        results = []
+        unique_days = set()
+        
+        for activity in self.data.values():
+            days = activity.get("schedule_details", {}).get("days", [])
+            for day in days:
+                unique_days.add(day)
+        
+        return [{"_id": day} for day in sorted(unique_days)]
+    
+    def _matches_query(self, doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
+        """Optimized query matching"""
+        for key, value in query.items():
+            if "." in key:
+                # Handle nested keys efficiently
+                keys = key.split(".")
+                current = doc
+                for k in keys:
+                    if isinstance(current, dict) and k in current:
+                        current = current[k]
+                    else:
+                        return False
+                
+                if isinstance(value, dict):
+                    if "$in" in value:
+                        if not isinstance(current, list) or not any(item in current for item in value["$in"]):
+                            return False
+                    elif "$gte" in value:
+                        if current < value["$gte"]:
+                            return False
+                    elif "$lte" in value:
+                        if current > value["$lte"]:
+                            return False
+                elif current != value:
+                    return False
+            else:
+                if key not in doc or doc[key] != value:
+                    return False
+        return True
+
+class UpdateResult:
+    """Simple update result class"""
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+# Create optimized collection instances
+activities_collection = InMemoryCollection(activities_data)
+teachers_collection = InMemoryCollection(teachers_data)
+
+# Initial database if empty
 initial_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
@@ -143,10 +312,6 @@ initial_activities = {
     }
 }
 
-def hash_password(password: str) -> str:
-    """Hash password using SHA-256 for consistency and performance"""
-    return hashlib.sha256(password.encode()).hexdigest()
-
 initial_teachers = [
     {
         "username": "mrodriguez",
@@ -168,167 +333,3 @@ initial_teachers = [
     }
 ]
 
-# In-memory storage with performance optimizations
-activities_data: Dict[str, Dict[str, Any]] = {}
-teachers_data: Dict[str, Dict[str, Any]] = {}
-
-# Create indexed lookups for performance
-_day_index: Dict[str, List[str]] = {}  # day -> list of activity names
-_time_index: Dict[str, List[str]] = {}  # time_range -> list of activity names
-
-def _build_indexes():
-    """Build performance indexes for faster filtering"""
-    global _day_index, _time_index
-    _day_index.clear()
-    _time_index.clear()
-    
-    for activity_name, activity in activities_data.items():
-        # Index by days
-        for day in activity.get("schedule_details", {}).get("days", []):
-            if day not in _day_index:
-                _day_index[day] = []
-            _day_index[day].append(activity_name)
-        
-        # Index by time ranges for faster filtering
-        start_time = activity.get("schedule_details", {}).get("start_time", "")
-        end_time = activity.get("schedule_details", {}).get("end_time", "")
-        if start_time and end_time:
-            time_key = f"{start_time}-{end_time}"
-            if time_key not in _time_index:
-                _time_index[time_key] = []
-            _time_index[time_key].append(activity_name)
-
-def init_database():
-    """Initialize in-memory database if empty - optimized for performance"""
-    global activities_data, teachers_data
-    
-    # Initialize activities if empty
-    if not activities_data:
-        activities_data.update(deepcopy(initial_activities))
-        
-    # Initialize teacher accounts if empty  
-    if not teachers_data:
-        for teacher in initial_teachers:
-            teachers_data[teacher["username"]] = teacher.copy()
-    
-    # Build performance indexes
-    _build_indexes()
-
-class InMemoryCollection:
-    """High-performance in-memory collection that mimics MongoDB interface"""
-    
-    def __init__(self, data_store: Dict[str, Dict[str, Any]]):
-        self.data = data_store
-    
-    def find(self, query: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        """Optimized find with indexing support"""
-        if not query:
-            return [{"_id": k, **v} for k, v in self.data.items()]
-        
-        # Optimize day-based queries using index
-        if "schedule_details.days" in query:
-            day_filter = query["schedule_details.days"]
-            if isinstance(day_filter, dict) and "$in" in day_filter:
-                day = day_filter["$in"][0]
-                if day in _day_index:
-                    matching_names = _day_index[day]
-                    results = []
-                    for name in matching_names:
-                        activity = self.data.get(name)
-                        if activity and self._matches_query({"_id": name, **activity}, query):
-                            results.append({"_id": name, **activity})
-                    return results
-        
-        # Fallback to full scan with optimized matching
-        results = []
-        for k, v in self.data.items():
-            doc = {"_id": k, **v}
-            if self._matches_query(doc, query):
-                results.append(doc)
-        return results
-    
-    def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Optimized single document lookup"""
-        # Direct ID lookup for performance
-        if "_id" in query and len(query) == 1:
-            doc_id = query["_id"]
-            if doc_id in self.data:
-                return {"_id": doc_id, **self.data[doc_id]}
-            return None
-        
-        # Use find and return first result
-        results = self.find(query)
-        return results[0] if results else None
-    
-    def update_one(self, query: Dict[str, Any], update: Dict[str, Any]) -> 'UpdateResult':
-        """Optimized single document update"""
-        doc = self.find_one(query)
-        if not doc:
-            return UpdateResult(0)
-        
-        doc_id = doc["_id"]
-        
-        if "$push" in update:
-            for field, value in update["$push"].items():
-                if field not in self.data[doc_id]:
-                    self.data[doc_id][field] = []
-                self.data[doc_id][field].append(value)
-        
-        if "$pull" in update:
-            for field, value in update["$pull"].items():
-                if field in self.data[doc_id] and isinstance(self.data[doc_id][field], list):
-                    while value in self.data[doc_id][field]:
-                        self.data[doc_id][field].remove(value)
-        
-        return UpdateResult(1)
-    
-    def aggregate(self, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Optimized aggregation for day lookup"""
-        results = []
-        unique_days = set()
-        
-        for activity in self.data.values():
-            days = activity.get("schedule_details", {}).get("days", [])
-            for day in days:
-                unique_days.add(day)
-        
-        return [{"_id": day} for day in sorted(unique_days)]
-    
-    def _matches_query(self, doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
-        """Optimized query matching"""
-        for key, value in query.items():
-            if "." in key:
-                # Handle nested keys efficiently
-                keys = key.split(".")
-                current = doc
-                for k in keys:
-                    if isinstance(current, dict) and k in current:
-                        current = current[k]
-                    else:
-                        return False
-                
-                if isinstance(value, dict):
-                    if "$in" in value:
-                        if not isinstance(current, list) or not any(item in current for item in value["$in"]):
-                            return False
-                    elif "$gte" in value:
-                        if current < value["$gte"]:
-                            return False
-                    elif "$lte" in value:
-                        if current > value["$lte"]:
-                            return False
-                elif current != value:
-                    return False
-            else:
-                if key not in doc or doc[key] != value:
-                    return False
-        return True
-
-class UpdateResult:
-    """Simple update result class"""
-    def __init__(self, modified_count: int):
-        self.modified_count = modified_count
-
-# Create optimized collection instances
-activities_collection = InMemoryCollection(activities_data)
-teachers_collection = InMemoryCollection(teachers_data)
