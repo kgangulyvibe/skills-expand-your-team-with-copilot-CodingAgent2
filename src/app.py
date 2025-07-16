@@ -3,25 +3,33 @@ High School Management System API
 
 A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
+
+Performance optimized with in-memory storage and response caching.
 """
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.middleware.gzip import GZipMiddleware
 import os
 from pathlib import Path
 from backend import routers, database
 
-# Initialize web host
+# Initialize web host with performance optimizations
 app = FastAPI(
     title="Mergington High School API",
-    description="API for viewing and signing up for extracurricular activities"
+    description="API for viewing and signing up for extracurricular activities",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
+
+# Add compression middleware for better performance
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Initialize database with sample data if empty
 database.init_database()
 
-# Mount the static files directory for serving the frontend
+# Mount the static files directory for serving the frontend with caching
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(current_dir, "static")), name="static")
 
